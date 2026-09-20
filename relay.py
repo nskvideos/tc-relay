@@ -213,6 +213,17 @@ def handle_status_data(m, data):
             })
         m["lastAutoWin"] = {"count": m.get("livePlays", 0), "player": win_player, "time": now_iso()}
         won = True
+        # THREE_CLAW fixed-payout math, now computed here (shared) rather
+        # than by each browser individually — see the payoutAction handler
+        # below for how threeClawUsualRate gets set in the first place.
+        # Only runs once a usual rate has actually been set for this
+        # machine; until then these three fields just stay None.
+        if m.get("threeClawUsualRate") is not None:
+            prior_payout = m.get("threeClawPayout")
+            if prior_payout is None:
+                prior_payout = m["threeClawUsualRate"]
+            m["threeClawLastPayoutOwed"] = prior_payout - m.get("livePlays", 0)
+            m["threeClawPayout"] = m["threeClawUsualRate"] + m["threeClawLastPayoutOwed"]
         m["livePlays"] = 0
     # "playing" -> "continue" means this attempt didn't win yet; no count
     # change. status -> "playable" means the player stopped; no count
@@ -261,6 +272,20 @@ def new_machine_state(machine_id, prize_id):
         "prizeStale": False,
         "lastFields": {},
         "liveStatus": {"ok": False, "msg": "Connecting…"},
+        # Shared (not personal) — an explicit category override. When None,
+        # every browser derives the display category itself from
+        # prizeTitleEn (e.g. "Figure - ..." -> "Figures"), so most machines
+        # never need this set at all; it only exists so someone can move a
+        # machine into a different category than its title would imply,
+        # with that change visible to everyone watching the dashboard.
+        "category": None,
+        # THREE_CLAW fixed-payout tracker — shared so one person setting the
+        # usual rate benefits everyone watching, instead of each friend
+        # having to know how to use it themselves. None until someone sets
+        # a usual rate via a payoutAction message.
+        "threeClawUsualRate": None,
+        "threeClawLastPayoutOwed": None,
+        "threeClawPayout": None,
     }
 
 
@@ -437,6 +462,51 @@ async def stop_tracking(machine_id, prize_id):
     await broadcast({"type": "machineRemoved", "data": {"machineId": machine_id, "prizeId": prize_id}})
 
 
+async def set_category(machine_id, prize_id, category):
+    """Shared category override, settable by anyone watching the dashboard.
+    If the machine isn't tracked yet (e.g. this arrives a moment before its
+    startTracking call finishes), create a stub record now — start_tracking
+    will see it already exists and only fill in the connection-related
+    fields, leaving this category untouched."""
+    key = machine_key(machine_id, prize_id)
+    m = await store.load(key)
+    if m is None:
+        m = new_machine_state(machine_id, prize_id)
+    m["category"] = category if category else None
+    await store.save(key, m)
+    log(f"Set category for {key} to {m['category']!r}")
+    await broadcast_machine(m)
+
+
+async def handle_payout_action(machine_id, prize_id, action, value):
+    """One consolidated shared-state entry point for the THREE_CLAW payout
+    tracker's four controls (usual rate, last-payout-owed, compute,
+    reset-to-usual) — mirrors what each button used to do to a browser's
+    local prefs, just applied to the relay's shared machine record instead
+    so every browser sees the same numbers."""
+    key = machine_key(machine_id, prize_id)
+    m = await store.load(key)
+    if m is None:
+        m = new_machine_state(machine_id, prize_id)
+
+    if action == "setRate":
+        m["threeClawUsualRate"] = value if isinstance(value, (int, float)) else None
+    elif action == "setOwed":
+        m["threeClawLastPayoutOwed"] = value if isinstance(value, (int, float)) else None
+    elif action == "compute":
+        rate = m.get("threeClawUsualRate")
+        owed = m.get("threeClawLastPayoutOwed")
+        if isinstance(rate, (int, float)) and isinstance(owed, (int, float)):
+            m["threeClawPayout"] = rate + owed
+    elif action == "reset":
+        m["threeClawPayout"] = None
+    else:
+        return  # unknown action — ignore rather than save a no-op change
+
+    await store.save(key, m)
+    await broadcast_machine(m)
+
+
 async def resume_all_tracked():
     """On relay startup, reconnect upstream for anything the store already
     has recorded as tracked (relevant once Store is backed by Upstash and
@@ -487,6 +557,21 @@ async def handle_browser(websocket):
                 prize_id = data.get("prizeId")
                 if machine_id and prize_id:
                     asyncio.create_task(stop_tracking(machine_id, prize_id))
+
+            elif msg_type == "setCategory":
+                machine_id = data.get("machineId")
+                prize_id = data.get("prizeId")
+                category = data.get("category")
+                if machine_id and prize_id:
+                    asyncio.create_task(set_category(machine_id, prize_id, category))
+
+            elif msg_type == "payoutAction":
+                machine_id = data.get("machineId")
+                prize_id = data.get("prizeId")
+                action = data.get("action")
+                value = data.get("value")
+                if machine_id and prize_id and action:
+                    asyncio.create_task(handle_payout_action(machine_id, prize_id, action, value))
 
             # 'initClient' and 'ping' from the browser are no-ops here — the
             # relay owns its own upstream connections and keepalives
