@@ -243,6 +243,11 @@ def handle_status_data(m, data):
                 m["prizeTitleJa"] = title["ja"]
         if "gemCost" in prize:
             m["gemCost"] = prize["gemCost"]
+        # Label such as "LAST_CHANCE" (MACHINE_INIT > data > prize > label).
+        # Re-read on every full prize object so it also clears when
+        # TokyoCatch removes the label from a prize.
+        if "label" in prize or "title" in prize:
+            m["prizeLabel"] = prize.get("label")
 
     if status:
         m["lastStatus"] = status
@@ -269,6 +274,7 @@ def new_machine_state(machine_id, prize_id):
         "prizeTitleEn": None,
         "prizeTitleJa": None,
         "gemCost": None,
+        "prizeLabel": None,
         "prizeStale": False,
         "lastFields": {},
         "liveStatus": {"ok": False, "msg": "Connecting…"},
