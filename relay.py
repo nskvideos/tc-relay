@@ -353,11 +353,15 @@ async def pump_upstream(key):
             if msg.get("error"):
                 err = msg["error"]
                 if err.get("code") == "IRRELEVANT_PRIZE_FOR_MACHINE":
+                    log(f"{key}: TokyoCatch error message: {raw}")
                     if not m.get("prizeStale"):
                         m["prizeStale"] = True
+                        # Flips to True only if TokyoCatch actually keeps
+                        # sending play data after the error — see below.
+                        m["dataSinceStale"] = False
                         m["liveStatus"] = {
                             "ok": False,
-                            "msg": "⚠️ Prize no longer on this machine — still counting plays.",
+                            "msg": "⚠️ Prize no longer on this machine — waiting to see if TokyoCatch keeps sending play data.",
                         }
                 else:
                     m["liveStatus"] = {
@@ -378,6 +382,8 @@ async def pump_upstream(key):
                 # plays still get counted under this one.
                 handle_status_data(m, msg.get("data") or {})
                 if m.get("prizeStale"):
+                    m["dataSinceStale"] = True
+                    log(f"{key}: stale prize but received {msg_type} — counted")
                     m["liveStatus"] = {"ok": False, "msg": "⚠️ Prize no longer on this machine — still counting plays. Last update " + now_iso()}
                 else:
                     m["liveStatus"] = {"ok": True, "msg": "Live — last update " + now_iso()}
