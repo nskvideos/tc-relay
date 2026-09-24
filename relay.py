@@ -357,7 +357,7 @@ async def pump_upstream(key):
                         m["prizeStale"] = True
                         m["liveStatus"] = {
                             "ok": False,
-                            "msg": "⚠️ Prize no longer on this machine — plays have paused counting.",
+                            "msg": "⚠️ Prize no longer on this machine — still counting plays.",
                         }
                 else:
                     m["liveStatus"] = {
@@ -370,15 +370,17 @@ async def pump_upstream(key):
 
             msg_type = msg.get("type")
             if msg_type in ("MACHINE_INIT", "MACHINE_STATUS_UPDATED", "MACHINE_QUEUE_UPDATED"):
-                if m.get("prizeStale"):
-                    # Ignore further status data until the prize link is
-                    # corrected via stopTracking+startTracking with the new
-                    # prizeId — otherwise plays for the new prize would
-                    # silently get counted as if they still belonged to the
-                    # old one.
-                    continue
+                # Counting deliberately CONTINUES even when prizeStale is
+                # set: the flag only raises a warning on the dashboard. This
+                # keeps the count/history intact if the prize is swapped out
+                # and later comes back or new prizes are added. Trade-off:
+                # if the machine is really running a different prize, its
+                # plays still get counted under this one.
                 handle_status_data(m, msg.get("data") or {})
-                m["liveStatus"] = {"ok": True, "msg": "Live — last update " + now_iso()}
+                if m.get("prizeStale"):
+                    m["liveStatus"] = {"ok": False, "msg": "⚠️ Prize no longer on this machine — still counting plays. Last update " + now_iso()}
+                else:
+                    m["liveStatus"] = {"ok": True, "msg": "Live — last update " + now_iso()}
                 await store.save(key, m)
                 await broadcast_machine(m)
             # other message types (pings, etc.) are ignored
