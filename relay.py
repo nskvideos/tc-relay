@@ -400,16 +400,23 @@ async def pump_upstream(key):
                 asyncio.create_task(start_tracking(m["machineId"], m["prizeId"]))
 
 
-async def start_tracking(machine_id, prize_id):
+async def start_tracking(machine_id, prize_id, category=None):
     key = machine_key(machine_id, prize_id)
     if key in runtime:
-        return  # already tracking
+        # already tracking — but still honour a category supplied with the request
+        if category:
+            await set_category(machine_id, prize_id, category)
+        return
 
     existing = await store.load(key)
     if existing is None:
         existing = new_machine_state(machine_id, prize_id)
+        if category:
+            existing["category"] = category
         await store.save(key, existing)
     else:
+        if category:
+            existing["category"] = category
         # resuming a previously-tracked machine (e.g. after a relay
         # restart) — keep its history/count, just reconnect upstream.
         existing["liveStatus"] = {"ok": False, "msg": "Reconnecting…"}
@@ -557,8 +564,9 @@ async def handle_browser(websocket):
             elif msg_type == "startTracking":
                 machine_id = data.get("machineId")
                 prize_id = data.get("prizeId")
+                category = (data.get("category") or "").strip() or None
                 if machine_id and prize_id:
-                    asyncio.create_task(start_tracking(machine_id, prize_id))
+                    asyncio.create_task(start_tracking(machine_id, prize_id, category))
 
             elif msg_type == "stopTracking":
                 machine_id = data.get("machineId")
