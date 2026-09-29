@@ -248,6 +248,10 @@ def handle_status_data(m, data):
         # TokyoCatch removes the label from a prize.
         if "label" in prize or "title" in prize:
             m["prizeLabel"] = prize.get("label")
+        # Prize picture (MACHINE_INIT > data > prize > imageUrl).
+        # Only overwrite when TokyoCatch actually sends one.
+        if prize.get("imageUrl"):
+            m["prizeImageUrl"] = prize["imageUrl"]
 
     if status:
         m["lastStatus"] = status
@@ -275,6 +279,7 @@ def new_machine_state(machine_id, prize_id):
         "prizeTitleJa": None,
         "gemCost": None,
         "prizeLabel": None,
+        "prizeImageUrl": None,
         "prizeStale": False,
         "lastFields": {},
         "liveStatus": {"ok": False, "msg": "Connecting…"},
