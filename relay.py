@@ -54,7 +54,10 @@ follow-up piece, not optional, given the "always counting" goal.
 
 import asyncio
 import json
+from http import HTTPStatus
 import os
+import random
+import signal
 import time
 import httpx
 import websockets
@@ -65,6 +68,8 @@ UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 TRACKED_SET_KEY = "claw:tracked_machines"
 MACHINE_KEY_PREFIX = "claw:machine:"
+FLUSH_SECONDS = 5      # how often changed machines are written to Upstash
+MAX_HISTORY = 300      # step-history rows kept per prize (dashboard shows the latest 80)
 
 
 def log(msg):
@@ -93,13 +98,21 @@ def machine_key(machine_id, prize_id):
 # Upstash credentials on hand — just without persistence across restarts.
 # ---------------------------------------------------------------------------
 class Store:
+    """State lives in memory (`_cache`) and is the source of truth while the
+    relay runs. Upstash is only read at startup (or on a cache miss) and is
+    written by a background flush every FLUSH_SECONDS, not on every single
+    TokyoCatch message. That removes a GET + parse + SET + SADD per message,
+    which was the main source of memory churn and Upstash command usage."""
+
     def __init__(self):
         self._use_redis = bool(UPSTASH_URL and UPSTASH_TOKEN)
+        self._cache = {}      # key -> state dict
+        self._known = None    # set of tracked keys (redis mode, loaded lazily)
+        self._dirty = set()   # keys changed since the last flush
         if self._use_redis:
             self._client = httpx.AsyncClient(timeout=10)
             log("Store: using Upstash Redis for persistence")
         else:
-            self._memory = {}
             log("Store: UPSTASH_REDIS_REST_URL/TOKEN not set — using in-memory storage "
                 "(state will NOT survive a restart; fine for local testing, not for production)")
 
@@ -115,31 +128,74 @@ class Store:
             raise RuntimeError(f"Upstash error on {args[0]}: {data['error']}")
         return data.get("result")
 
+    async def _ensure_known(self):
+        if self._known is None:
+            self._known = set(await self._cmd("SMEMBERS", TRACKED_SET_KEY) or [])
+
     async def list_keys(self):
         if not self._use_redis:
-            return list(self._memory.keys())
-        result = await self._cmd("SMEMBERS", TRACKED_SET_KEY)
-        return result or []
+            return list(self._cache.keys())
+        await self._ensure_known()
+        return list(self._known)
 
     async def load(self, key):
+        if key in self._cache:
+            return self._cache[key]
         if not self._use_redis:
-            return self._memory.get(key)
+            return None
+        await self._ensure_known()
+        if key not in self._known:
+            return None
         raw = await self._cmd("GET", MACHINE_KEY_PREFIX + key)
-        return json.loads(raw) if raw is not None else None
+        if raw is None:
+            return None
+        state = json.loads(raw)
+        self._cache[key] = state
+        return state
 
     async def save(self, key, state):
+        self._cache[key] = state
         if not self._use_redis:
-            self._memory[key] = state
             return
-        await self._cmd("SET", MACHINE_KEY_PREFIX + key, json.dumps(state))
-        await self._cmd("SADD", TRACKED_SET_KEY, key)
+        await self._ensure_known()
+        self._dirty.add(key)
+        if key not in self._known:
+            self._known.add(key)
+            await self._cmd("SADD", TRACKED_SET_KEY, key)
 
     async def delete(self, key):
+        self._cache.pop(key, None)
+        self._dirty.discard(key)
         if not self._use_redis:
-            self._memory.pop(key, None)
             return
+        await self._ensure_known()
+        self._known.discard(key)
         await self._cmd("DEL", MACHINE_KEY_PREFIX + key)
         await self._cmd("SREM", TRACKED_SET_KEY, key)
+
+    async def flush(self):
+        """Write every changed machine to Upstash (one SET each)."""
+        if not self._use_redis or not self._dirty:
+            return
+        keys = list(self._dirty)
+        self._dirty.clear()
+        for key in keys:
+            state = self._cache.get(key)
+            if state is None:
+                continue  # deleted since it was marked dirty
+            try:
+                await self._cmd("SET", MACHINE_KEY_PREFIX + key, json.dumps(state))
+            except Exception as e:
+                self._dirty.add(key)  # try again next round
+                log(f"Store flush failed for {key}: {e}")
+
+    async def flush_loop(self):
+        while True:
+            await asyncio.sleep(FLUSH_SECONDS)
+            try:
+                await self.flush()
+            except Exception as e:
+                log(f"Store flush loop error: {e}")
 
 
 store = Store()
@@ -169,7 +225,17 @@ browsers = set()
 #     only from `currentPlayingUser`.
 # Returns True if this call just detected a win (so the caller can log it).
 # ---------------------------------------------------------------------------
+def trim_history(m):
+    """Keep the step history bounded so memory and every saved/broadcast
+    message stop growing forever. Counts are stored separately (livePlays,
+    lastAutoWin), so trimming old rows doesn't affect them."""
+    h = m.get("history")
+    if h is not None and len(h) > MAX_HISTORY + 100:
+        del h[:-MAX_HISTORY]
+
+
 def handle_status_data(m, data):
+    trim_history(m)
     status = data.get("status")
     current_playing_user = data.get("currentPlayingUser")
     player_id = current_playing_user.get("id") if current_playing_user else None
@@ -321,18 +387,15 @@ async def broadcast_machine(state):
 # ---------------------------------------------------------------------------
 # Per-machine upstream connection lifecycle
 # ---------------------------------------------------------------------------
-async def keepalive(key):
+async def keepalive(key, upstream):
     """TokyoCatch expects a periodic app-level ping to keep the subscription
-    alive. One per tracked machine, regardless of how many browsers are
-    watching — no need for a per-browser keepalive timer."""
+    alive. One per upstream connection (bound to THAT connection, so a stale
+    task can never keep running after a reconnect)."""
     try:
         while True:
             await asyncio.sleep(15)
-            rt = runtime.get(key)
-            if not rt:
-                break
             try:
-                await rt["upstream"].send(json.dumps({"type": "ping"}))
+                await upstream.send(json.dumps({"type": "ping"}))
             except Exception:
                 break
     except asyncio.CancelledError:
@@ -403,12 +466,20 @@ async def pump_upstream(key):
             m["liveStatus"] = {"ok": False, "msg": "Upstream connection to TokyoCatch closed — reconnecting…"}
             await store.save(key, m)
             await broadcast_machine(m)
-        # Unexpected close (not an explicit stopTracking) — try to
-        # reconnect rather than dropping tracking silently.
-        if key in runtime:
+        # Stop this connection's keepalive and release the socket.
+        ka = rt.get("keepalive_task")
+        if ka:
+            ka.cancel()
+        try:
+            await upstream.close()
+        except Exception:
+            pass
+        # Unexpected close (not an explicit stopTracking) — reconnect, and
+        # keep retrying with a delay if TokyoCatch isn't accepting us yet.
+        if runtime.get(key) is rt:
             runtime.pop(key, None)
             if m is not None:
-                asyncio.create_task(start_tracking(m["machineId"], m["prizeId"]))
+                asyncio.create_task(reconnect(m["machineId"], m["prizeId"]))
 
 
 async def start_tracking(machine_id, prize_id, category=None):
@@ -417,7 +488,7 @@ async def start_tracking(machine_id, prize_id, category=None):
         # already tracking — but still honour a category supplied with the request
         if category:
             await set_category(machine_id, prize_id, category)
-        return
+        return True
 
     existing = await store.load(key)
     if existing is None:
@@ -439,6 +510,7 @@ async def start_tracking(machine_id, prize_id, category=None):
             upstream = await websockets.connect(
                 TOKYOCATCH_WS_URL,
                 additional_headers={"Origin": "https://tokyocatch.com"},
+                compression=None,
             )
         except TypeError:
             # Older/legacy websockets versions use "extra_headers" instead
@@ -446,12 +518,13 @@ async def start_tracking(machine_id, prize_id, category=None):
             upstream = await websockets.connect(
                 TOKYOCATCH_WS_URL,
                 extra_headers={"Origin": "https://tokyocatch.com"},
+                compression=None,
             )
     except Exception as e:
         existing["liveStatus"] = {"ok": False, "msg": f"Could not connect to TokyoCatch: {e}"}
         await store.save(key, existing)
         await broadcast_machine(existing)
-        return
+        return False
 
     await upstream.send(json.dumps({
         "type": "machineSubscription",
@@ -464,11 +537,29 @@ async def start_tracking(machine_id, prize_id, category=None):
 
     runtime[key] = {"upstream": upstream}
     runtime[key]["pump_task"] = asyncio.create_task(pump_upstream(key))
-    runtime[key]["keepalive_task"] = asyncio.create_task(keepalive(key))
+    runtime[key]["keepalive_task"] = asyncio.create_task(keepalive(key, upstream))
 
     existing["liveStatus"] = {"ok": True, "msg": "Connected — waiting for machine data…"}
     await store.save(key, existing)
     await broadcast_machine(existing)
+    return True
+
+
+async def reconnect(machine_id, prize_id):
+    """Re-open a dropped upstream connection. Waits a moment (with jitter, so
+    all prizes don't hit TokyoCatch in the same instant after a mass drop) and
+    keeps retrying with a growing delay until it works or tracking is stopped."""
+    key = machine_key(machine_id, prize_id)
+    delay = 2
+    while True:
+        await asyncio.sleep(delay + random.random() * 3)
+        if await store.load(key) is None:
+            return  # tracking was stopped while we were waiting
+        if key in runtime:
+            return  # something else already reconnected it
+        if await start_tracking(machine_id, prize_id):
+            return
+        delay = min(delay * 2, 60)
 
 
 async def stop_tracking(machine_id, prize_id):
@@ -610,6 +701,52 @@ async def handle_browser(websocket):
         log(f"Browser disconnected ({len(browsers)} watching)")
 
 
+# ---------------------------------------------------------------------------
+# HEAD support (for UptimeRobot and similar monitors).
+#
+# The websockets library refuses any HTTP request that isn't a GET with a
+# "400 Bad Request" BEFORE process_request ever runs. UptimeRobot's free plan
+# pings with HEAD, so it always saw a 400 and showed a permanent "incident".
+# This subclass reads the request line itself, and answers HEAD with a plain
+# 200. GET and WebSocket handshakes behave exactly as before. If the library
+# internals ever differ from what this expects, the import below fails and the
+# relay simply falls back to the stock behaviour (monitor shows 400 again, but
+# everything else keeps working).
+# ---------------------------------------------------------------------------
+try:
+    from websockets.datastructures import Headers as _Headers
+    from websockets.exceptions import InvalidMessage as _InvalidMessage
+    from websockets.legacy.exceptions import AbortHandshake as _AbortHandshake
+    from websockets.legacy.http import read_headers as _read_headers, read_line as _read_line
+    from websockets.legacy.server import WebSocketServerProtocol as _WSProtocol
+
+    class HeadAwareProtocol(_WSProtocol):
+        async def read_http_request(self):
+            try:
+                request_line = await _read_line(self.reader)
+                method, raw_path, _version = request_line.split(b" ", 2)
+                if method not in (b"GET", b"HEAD"):
+                    raise ValueError(f"unsupported HTTP method: {method!r}")
+                path = raw_path.decode("ascii", "surrogateescape")
+                headers = await _read_headers(self.reader)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise _InvalidMessage("did not receive a valid HTTP request") from exc
+            self.path = path
+            self.request_headers = headers
+            if method == b"HEAD":
+                # Same "relay is up" answer a GET gets, minus the body.
+                raise _AbortHandshake(HTTPStatus.OK, _Headers(), b"")
+            return path, headers
+
+    HEAD_SUPPORT = True
+except Exception as _e:  # pragma: no cover
+    HeadAwareProtocol = None
+    HEAD_SUPPORT = False
+    print(f"HEAD support unavailable, using stock websockets behaviour: {_e!r}", flush=True)
+
+
 async def process_request(path, request_headers):
     """Let plain HTTP requests (e.g. someone opening the URL in a browser tab
     directly, or a hosting platform's health check) get a friendly response
@@ -621,14 +758,28 @@ async def process_request(path, request_headers):
 
 async def main():
     await resume_all_tracked()
+    flusher = asyncio.create_task(store.flush_loop())
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+    serve_kwargs = {"process_request": process_request}
+    if HeadAwareProtocol is not None:
+        serve_kwargs["create_protocol"] = HeadAwareProtocol
     async with websockets.serve(
         handle_browser,
         "0.0.0.0",
         PORT,
-        process_request=process_request,
+        **serve_kwargs,
     ):
-        log(f"Relay listening on 0.0.0.0:{PORT}")
-        await asyncio.Future()  # run forever
+        log(f"Relay listening on 0.0.0.0:{PORT} (HEAD support: {'on' if HEAD_SUPPORT else 'off'})")
+        await stop.wait()  # run until Render asks us to shut down
+    flusher.cancel()
+    await store.flush()  # don't lose the last few seconds of changes on redeploy
+    log("Shut down cleanly")
 
 
 if __name__ == "__main__":
