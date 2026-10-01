@@ -347,6 +347,11 @@ def new_machine_state(machine_id, prize_id):
         "prizeLabel": None,
         "prizeImageUrl": None,
         "prizeStale": False,
+        # When TokyoCatch flags this prize irrelevant and another prize on
+        # the same machine takes over, the count/history/payout move there
+        # and this holds that prize's id (this prize then stops counting).
+        "countMovedTo": None,
+        "trackedSince": now_iso(),
         "lastFields": {},
         "liveStatus": {"ok": False, "msg": "Connecting…"},
         # Shared (not personal) — an explicit category override. When None,
@@ -364,6 +369,75 @@ def new_machine_state(machine_id, prize_id):
         "threeClawLastPayoutOwed": None,
         "threeClawPayout": None,
     }
+
+
+def transfer_count(src, dst):
+    """Move a machine's running count, history and payout numbers from the
+    prize that just went irrelevant (src) onto the prize now on the machine
+    (dst). src was live right up to the swap, so its count is the machine's
+    count; anything dst counted since then is added on top. If dst has
+    already logged a win of its own, its count is already post-win, so only
+    the marker is set."""
+    carry = src.get("livePlays", 0)
+    if not any(r.get("isWin") for r in dst.get("history", [])):
+        for r in dst.get("history", []):
+            r["step"] = r.get("step", 0) + carry
+            r["sinceWin"] = r.get("sinceWin", 0) + carry
+        dst["history"] = list(src.get("history", [])) + dst.get("history", [])
+        dst["livePlays"] = carry + dst.get("livePlays", 0)
+        if dst.get("lastAutoWin") is None:
+            dst["lastAutoWin"] = src.get("lastAutoWin")
+        dst["threeClawLastPayoutOwed"] = src.get("threeClawLastPayoutOwed")
+        dst["threeClawPayout"] = src.get("threeClawPayout")
+    if dst.get("threeClawUsualRate") is None:
+        dst["threeClawUsualRate"] = src.get("threeClawUsualRate")
+    trim_history(dst)
+    src["countMovedTo"] = dst["prizeId"]
+
+
+async def handoff_count(stale_key, stale):
+    """Called when a prize is flagged IRRELEVANT_PRIZE_FOR_MACHINE: hand its
+    count to the newest still-relevant prize tracked on the same machine.
+    Does nothing (the stale prize keeps counting) if there isn't one yet;
+    start_tracking() does the handoff when one is added."""
+    if stale.get("countMovedTo"):
+        return
+    best = None
+    for k in await store.list_keys():
+        if k == stale_key or k not in runtime:
+            continue
+        o = await store.load(k)
+        if not o or o.get("machineId") != stale["machineId"] or o.get("prizeStale") or o.get("countMovedTo"):
+            continue
+        if best is None or (o.get("trackedSince") or "") > (best.get("trackedSince") or ""):
+            best = o
+    if best is None:
+        return
+    transfer_count(stale, best)
+    log(f"{stale_key}: irrelevant — count {stale.get('livePlays', 0)} moved to prize {best['prizeId']} "
+        f"(now {best.get('livePlays', 0)})")
+    await store.save(machine_key(best["machineId"], best["prizeId"]), best)
+    await broadcast_machine(best)
+
+
+async def move_count(machine_id, from_prize_id, to_prize_id):
+    """Manual handoff (the "Move count here" button): the person knows the
+    machine has swapped prizes, so move the count without waiting for
+    TokyoCatch to flag the old one. The old prize stops counting."""
+    if not (machine_id and from_prize_id and to_prize_id) or from_prize_id == to_prize_id:
+        return
+    src_key = machine_key(machine_id, from_prize_id)
+    dst_key = machine_key(machine_id, to_prize_id)
+    src = await store.load(src_key)
+    dst = await store.load(dst_key)
+    if not src or not dst or src.get("countMovedTo") or dst.get("countMovedTo"):
+        return
+    transfer_count(src, dst)
+    log(f"{src_key}: count {src.get('livePlays', 0)} moved by hand to prize {to_prize_id} (now {dst.get('livePlays', 0)})")
+    await store.save(src_key, src)
+    await store.save(dst_key, dst)
+    await broadcast_machine(src)
+    await broadcast_machine(dst)
 
 
 async def broadcast(msg):
@@ -431,6 +505,7 @@ async def pump_upstream(key):
                             "ok": False,
                             "msg": "⚠️ Prize no longer on this machine — waiting to see if TokyoCatch keeps sending play data.",
                         }
+                    await handoff_count(key, m)
                 else:
                     m["liveStatus"] = {
                         "ok": False,
@@ -442,6 +517,8 @@ async def pump_upstream(key):
 
             msg_type = msg.get("type")
             if msg_type in ("MACHINE_INIT", "MACHINE_STATUS_UPDATED", "MACHINE_QUEUE_UPDATED"):
+                if m.get("countMovedTo"):
+                    continue  # this prize's count now lives on the machine's current prize
                 # Counting deliberately CONTINUES even when prizeStale is
                 # set: the flag only raises a warning on the dashboard. This
                 # keeps the count/history intact if the prize is swapped out
@@ -495,6 +572,16 @@ async def start_tracking(machine_id, prize_id, category=None):
         existing = new_machine_state(machine_id, prize_id)
         if category:
             existing["category"] = category
+        # A new prize joining a machine whose earlier prize went irrelevant
+        # inherits that prize's count/history/payout.
+        for k in await store.list_keys():
+            o = await store.load(k)
+            if o and o.get("machineId") == machine_id and o.get("prizeStale") and not o.get("countMovedTo"):
+                transfer_count(o, existing)
+                log(f"{k}: count {o.get('livePlays', 0)} moved to new prize {prize_id}")
+                await store.save(k, o)
+                await broadcast_machine(o)
+                break
         await store.save(key, existing)
     else:
         if category:
@@ -682,6 +769,9 @@ async def handle_browser(websocket):
                 category = data.get("category")
                 if machine_id and prize_id:
                     asyncio.create_task(set_category(machine_id, prize_id, category))
+
+            elif msg_type == "moveCount":
+                asyncio.create_task(move_count(data.get("machineId"), data.get("fromPrizeId"), data.get("toPrizeId")))
 
             elif msg_type == "payoutAction":
                 machine_id = data.get("machineId")
