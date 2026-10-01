@@ -347,11 +347,6 @@ def new_machine_state(machine_id, prize_id):
         "prizeLabel": None,
         "prizeImageUrl": None,
         "prizeStale": False,
-        # When TokyoCatch flags this prize irrelevant and another prize on
-        # the same machine takes over, the count/history/payout move there
-        # and this holds that prize's id (this prize then stops counting).
-        "countMovedTo": None,
-        "trackedSince": now_iso(),
         "lastFields": {},
         "liveStatus": {"ok": False, "msg": "Connecting…"},
         # Shared (not personal) — an explicit category override. When None,
@@ -371,73 +366,80 @@ def new_machine_state(machine_id, prize_id):
     }
 
 
-def transfer_count(src, dst):
-    """Move a machine's running count, history and payout numbers from the
-    prize that just went irrelevant (src) onto the prize now on the machine
-    (dst). src was live right up to the swap, so its count is the machine's
-    count; anything dst counted since then is added on top. If dst has
-    already logged a win of its own, its count is already post-win, so only
-    the marker is set."""
-    carry = src.get("livePlays", 0)
-    if not any(r.get("isWin") for r in dst.get("history", [])):
-        for r in dst.get("history", []):
-            r["step"] = r.get("step", 0) + carry
-            r["sinceWin"] = r.get("sinceWin", 0) + carry
-        dst["history"] = list(src.get("history", [])) + dst.get("history", [])
-        dst["livePlays"] = carry + dst.get("livePlays", 0)
-        if dst.get("lastAutoWin") is None:
-            dst["lastAutoWin"] = src.get("lastAutoWin")
-        dst["threeClawLastPayoutOwed"] = src.get("threeClawLastPayoutOwed")
-        dst["threeClawPayout"] = src.get("threeClawPayout")
-    if dst.get("threeClawUsualRate") is None:
-        dst["threeClawUsualRate"] = src.get("threeClawUsualRate")
-    trim_history(dst)
-    src["countMovedTo"] = dst["prizeId"]
+# ---------------------------------------------------------------------------
+# Prizes on the same machine share one count. The play count, step history,
+# last win, current status and THREE_CLAW payout numbers describe the
+# MACHINE, so every prize record on a machineId carries identical copies of
+# them. Each prize still has its own upstream connection and its own title,
+# picture, label, stale flag and live status. Because the shared `lastStatus`
+# is updated by whichever connection sees an event first, the same event
+# arriving on a second connection finds the status already set and is not
+# counted twice.
+# ---------------------------------------------------------------------------
+SHARED_FIELDS = ("livePlays", "history", "lastAutoWin", "lastStatus", "lastFields",
+                 "threeClawUsualRate", "threeClawLastPayoutOwed", "threeClawPayout")
 
 
-async def handoff_count(stale_key, stale):
-    """Called when a prize is flagged IRRELEVANT_PRIZE_FOR_MACHINE: hand its
-    count to the newest still-relevant prize tracked on the same machine.
-    Does nothing (the stale prize keeps counting) if there isn't one yet;
-    start_tracking() does the handoff when one is added."""
-    if stale.get("countMovedTo"):
-        return
-    best = None
+async def siblings_of(machine_id, exclude_key):
+    """Loaded state dicts for the other prizes tracked on this machine."""
+    out = []
     for k in await store.list_keys():
-        if k == stale_key or k not in runtime:
+        if k == exclude_key:
             continue
         o = await store.load(k)
-        if not o or o.get("machineId") != stale["machineId"] or o.get("prizeStale") or o.get("countMovedTo"):
+        if o and o.get("machineId") == machine_id:
+            out.append(o)
+    return out
+
+
+def shared_sig(m):
+    return (m.get("livePlays"), len(m.get("history") or []), m.get("lastAutoWin"),
+            m.get("lastStatus"), m.get("threeClawUsualRate"),
+            m.get("threeClawLastPayoutOwed"), m.get("threeClawPayout"),
+            m.get("lastFields"))
+
+
+def mirror_shared(src, others):
+    """Copy the shared fields from src onto every other prize record. The
+    history list is shared by reference, so there is one list per machine."""
+    if src.get("history") is None:
+        src["history"] = []
+    for o in others:
+        for f in SHARED_FIELDS:
+            o[f] = src.get(f)
+
+
+def pick_leader(states):
+    """Which record's numbers win when records on one machine disagree: the
+    one with the most recent win (its count is already after that win), then
+    the highest play count."""
+    def rank(s):
+        win = (s.get("lastAutoWin") or {}).get("time") or ""
+        return (win, s.get("livePlays", 0))
+    return max(states, key=rank)
+
+
+async def reconcile_groups():
+    """At startup, make every machine's prize records agree before any
+    TokyoCatch data arrives. Differences are logged so nothing is silently
+    lost."""
+    groups = {}
+    for k in await store.list_keys():
+        m = await store.load(k)
+        if m:
+            groups.setdefault(m["machineId"], []).append((k, m))
+    for machine_id, items in groups.items():
+        if len(items) < 2:
             continue
-        if best is None or (o.get("trackedSince") or "") > (best.get("trackedSince") or ""):
-            best = o
-    if best is None:
-        return
-    transfer_count(stale, best)
-    log(f"{stale_key}: irrelevant — count {stale.get('livePlays', 0)} moved to prize {best['prizeId']} "
-        f"(now {best.get('livePlays', 0)})")
-    await store.save(machine_key(best["machineId"], best["prizeId"]), best)
-    await broadcast_machine(best)
-
-
-async def move_count(machine_id, from_prize_id, to_prize_id):
-    """Manual handoff (the "Move count here" button): the person knows the
-    machine has swapped prizes, so move the count without waiting for
-    TokyoCatch to flag the old one. The old prize stops counting."""
-    if not (machine_id and from_prize_id and to_prize_id) or from_prize_id == to_prize_id:
-        return
-    src_key = machine_key(machine_id, from_prize_id)
-    dst_key = machine_key(machine_id, to_prize_id)
-    src = await store.load(src_key)
-    dst = await store.load(dst_key)
-    if not src or not dst or src.get("countMovedTo") or dst.get("countMovedTo"):
-        return
-    transfer_count(src, dst)
-    log(f"{src_key}: count {src.get('livePlays', 0)} moved by hand to prize {to_prize_id} (now {dst.get('livePlays', 0)})")
-    await store.save(src_key, src)
-    await store.save(dst_key, dst)
-    await broadcast_machine(src)
-    await broadcast_machine(dst)
+        states = [m for _, m in items]
+        leader = pick_leader(states)
+        if any(shared_sig(m)[:7] != shared_sig(leader)[:7] for m in states):
+            log(f"Reconcile {machine_id}: using prize {leader['prizeId']} "
+                f"(plays {leader.get('livePlays', 0)}); others had "
+                + ", ".join(f"{m['prizeId'][:6]}={m.get('livePlays', 0)}" for m in states if m is not leader))
+        mirror_shared(leader, [m for m in states if m is not leader])
+        for k, m in items:
+            await store.save(k, m)
 
 
 async def broadcast(msg):
@@ -505,7 +507,6 @@ async def pump_upstream(key):
                             "ok": False,
                             "msg": "⚠️ Prize no longer on this machine — waiting to see if TokyoCatch keeps sending play data.",
                         }
-                    await handoff_count(key, m)
                 else:
                     m["liveStatus"] = {
                         "ok": False,
@@ -517,23 +518,29 @@ async def pump_upstream(key):
 
             msg_type = msg.get("type")
             if msg_type in ("MACHINE_INIT", "MACHINE_STATUS_UPDATED", "MACHINE_QUEUE_UPDATED"):
-                if m.get("countMovedTo"):
-                    continue  # this prize's count now lives on the machine's current prize
-                # Counting deliberately CONTINUES even when prizeStale is
-                # set: the flag only raises a warning on the dashboard. This
-                # keeps the count/history intact if the prize is swapped out
-                # and later comes back or new prizes are added. Trade-off:
-                # if the machine is really running a different prize, its
-                # plays still get counted under this one.
+                # Counting continues even when prizeStale is set: the flag
+                # only raises a warning on the dashboard. The count is shared
+                # by every prize on the machine, so it keeps going whichever
+                # of them TokyoCatch is sending data for.
+                # Load the machine's other prize records first, then handle the
+                # event and mirror the result with no await in between, so two
+                # connections can never interleave inside one update.
+                sibs = await siblings_of(m["machineId"], key)
+                before = shared_sig(m)
                 handle_status_data(m, msg.get("data") or {})
+                changed = shared_sig(m) != before
+                mirror_shared(m, sibs)
                 if m.get("prizeStale"):
                     m["dataSinceStale"] = True
-                    log(f"{key}: stale prize but received {msg_type} — counted")
-                    m["liveStatus"] = {"ok": False, "msg": "⚠️ Prize no longer on this machine — still counting plays. Last update " + now_iso()}
+                    m["liveStatus"] = {"ok": False, "msg": "⚠️ Prize no longer on this machine — plays are counted on the machine as a whole. Last update " + now_iso()}
                 else:
                     m["liveStatus"] = {"ok": True, "msg": "Live — last update " + now_iso()}
                 await store.save(key, m)
                 await broadcast_machine(m)
+                if changed:
+                    for o in sibs:
+                        await store.save(machine_key(o["machineId"], o["prizeId"]), o)
+                        await broadcast_machine(o)
             # other message types (pings, etc.) are ignored
     except Exception as e:
         log(f"Upstream for {key} closed: {e}")
@@ -572,16 +579,11 @@ async def start_tracking(machine_id, prize_id, category=None):
         existing = new_machine_state(machine_id, prize_id)
         if category:
             existing["category"] = category
-        # A new prize joining a machine whose earlier prize went irrelevant
-        # inherits that prize's count/history/payout.
-        for k in await store.list_keys():
-            o = await store.load(k)
-            if o and o.get("machineId") == machine_id and o.get("prizeStale") and not o.get("countMovedTo"):
-                transfer_count(o, existing)
-                log(f"{k}: count {o.get('livePlays', 0)} moved to new prize {prize_id}")
-                await store.save(k, o)
-                await broadcast_machine(o)
-                break
+        # A prize joining a machine that is already tracked shares that
+        # machine's count, history and payout from the start.
+        sibs = await siblings_of(machine_id, key)
+        if sibs:
+            mirror_shared(pick_leader(sibs), [existing])
         await store.save(key, existing)
     else:
         if category:
@@ -707,8 +709,13 @@ async def handle_payout_action(machine_id, prize_id, action, value):
     else:
         return  # unknown action — ignore rather than save a no-op change
 
+    sibs = await siblings_of(machine_id, key)
+    mirror_shared(m, sibs)
     await store.save(key, m)
     await broadcast_machine(m)
+    for o in sibs:
+        await store.save(machine_key(o["machineId"], o["prizeId"]), o)
+        await broadcast_machine(o)
 
 
 async def resume_all_tracked():
@@ -769,9 +776,6 @@ async def handle_browser(websocket):
                 category = data.get("category")
                 if machine_id and prize_id:
                     asyncio.create_task(set_category(machine_id, prize_id, category))
-
-            elif msg_type == "moveCount":
-                asyncio.create_task(move_count(data.get("machineId"), data.get("fromPrizeId"), data.get("toPrizeId")))
 
             elif msg_type == "payoutAction":
                 machine_id = data.get("machineId")
@@ -847,6 +851,7 @@ async def process_request(path, request_headers):
 
 
 async def main():
+    await reconcile_groups()
     await resume_all_tracked()
     flusher = asyncio.create_task(store.flush_loop())
     stop = asyncio.Event()
