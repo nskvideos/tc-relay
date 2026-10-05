@@ -234,6 +234,37 @@ def trim_history(m):
         del h[:-MAX_HISTORY]
 
 
+MIN_PLAY_GAP = 10  # seconds; two plays/wins on one machine can never be closer
+
+
+def apply_prize_meta(m, data):
+    """Prize title, label, picture etc. — per-prize facts that never touch the
+    shared count, so any connection may apply them."""
+    # Only MACHINE_INIT carries these — capture once and keep them for the
+    # life of the tracked machine.
+    if data.get("machineType") is not None:
+        m["machineType"] = data["machineType"]
+    prize = data.get("prize")
+    if prize:
+        title = prize.get("title")
+        if title:
+            if "en" in title:
+                m["prizeTitleEn"] = title["en"]
+            if "ja" in title:
+                m["prizeTitleJa"] = title["ja"]
+        if "gemCost" in prize:
+            m["gemCost"] = prize["gemCost"]
+        # Label such as "LAST_CHANCE" (MACHINE_INIT > data > prize > label).
+        # Re-read on every full prize object so it also clears when
+        # TokyoCatch removes the label from a prize.
+        if "label" in prize or "title" in prize:
+            m["prizeLabel"] = prize.get("label")
+        # Prize picture (MACHINE_INIT > data > prize > imageUrl).
+        # Only overwrite when TokyoCatch actually sends one.
+        if prize.get("imageUrl"):
+            m["prizeImageUrl"] = prize["imageUrl"]
+
+
 def handle_status_data(m, data):
     trim_history(m)
     status = data.get("status")
@@ -245,18 +276,26 @@ def handle_status_data(m, data):
     # A new play begins when status moves INTO "playing" from either
     # play_wait (a fresh play starting) or continue (another attempt in the
     # same session).
+    now_ts = time.time()
     if status == "playing" and last_status in ("play_wait", "continue"):
-        m["livePlays"] = m.get("livePlays", 0) + 1
-        m.setdefault("history", []).append({
-            "t": now_iso(),
-            "step": m["livePlays"],
-            "sinceWin": m["livePlays"],
-            "player": player_id or "",
-            "isWin": False,
-        })
+        # A real play takes far longer than MIN_PLAY_GAP, so a second "play"
+        # inside that window is an echo of the same one and is not counted.
+        if now_ts - (m.get("lastPlayAt") or 0.0) < MIN_PLAY_GAP:
+            log(f"{m['machineId']}: ignored a play {now_ts - m['lastPlayAt']:.1f}s after the last one (echo)")
+        else:
+            m["lastPlayAt"] = now_ts
+            m["livePlays"] = m.get("livePlays", 0) + 1
+            m.setdefault("history", []).append({
+                "t": now_iso(),
+                "step": m["livePlays"],
+                "sinceWin": m["livePlays"],
+                "player": player_id or "",
+                "isWin": False,
+            })
     # "get" is the confirmed win signal: log it, snapshot the count that led
     # to it, then reset the running counter back to zero.
-    elif status == "get" and last_status != "get":
+    elif status == "get" and last_status != "get" and now_ts - (m.get("lastWinAt") or 0.0) >= MIN_PLAY_GAP:
+        m["lastWinAt"] = now_ts
         win_player = player_id or ""
         history = m.setdefault("history", [])
         last_row = history[-1] if history else None
@@ -295,29 +334,7 @@ def handle_status_data(m, data):
     # change. status -> "playable" means the player stopped; no count
     # change either way.
 
-    # Only MACHINE_INIT carries these — capture once and keep them for the
-    # life of the tracked machine.
-    if data.get("machineType") is not None:
-        m["machineType"] = data["machineType"]
-    prize = data.get("prize")
-    if prize:
-        title = prize.get("title")
-        if title:
-            if "en" in title:
-                m["prizeTitleEn"] = title["en"]
-            if "ja" in title:
-                m["prizeTitleJa"] = title["ja"]
-        if "gemCost" in prize:
-            m["gemCost"] = prize["gemCost"]
-        # Label such as "LAST_CHANCE" (MACHINE_INIT > data > prize > label).
-        # Re-read on every full prize object so it also clears when
-        # TokyoCatch removes the label from a prize.
-        if "label" in prize or "title" in prize:
-            m["prizeLabel"] = prize.get("label")
-        # Prize picture (MACHINE_INIT > data > prize > imageUrl).
-        # Only overwrite when TokyoCatch actually sends one.
-        if prize.get("imageUrl"):
-            m["prizeImageUrl"] = prize["imageUrl"]
+    apply_prize_meta(m, data)
 
     if status:
         m["lastStatus"] = status
@@ -377,6 +394,7 @@ def new_machine_state(machine_id, prize_id):
 # counted twice.
 # ---------------------------------------------------------------------------
 SHARED_FIELDS = ("livePlays", "history", "lastAutoWin", "lastStatus", "lastFields",
+                 "lastPlayAt", "lastWinAt",
                  "threeClawUsualRate", "threeClawLastPayoutOwed", "threeClawPayout")
 
 
@@ -456,8 +474,72 @@ async def broadcast(msg):
         browsers.discard(d)
 
 
+# Browsers only ever show the latest 80 step-history rows, so that is all they
+# are sent (the relay still stores up to MAX_HISTORY). `historyTotal` carries
+# the real row count for the "Step history (N)" heading. This is what keeps a
+# new connection from receiving 26 prizes x 300 rows.
+HISTORY_TO_BROWSER = 80
+
+
+def history_rev(h):
+    """Changes whenever a row is added or the newest row becomes a win, so the
+    dashboard knows when its copy of the history is out of date."""
+    if not h:
+        return "0"
+    last = h[-1]
+    return f"{len(h)}:{last.get('t', '')}:{int(bool(last.get('isWin')))}:{last.get('step', '')}"
+
+
+def slim_state(m):
+    """What every browser receives on connect and on every update: the prize
+    without its step history (about 9 KB saved per prize). The dashboard asks
+    for the history with a getHistory message, and only for cards that are
+    expanded."""
+    d = dict(m)
+    h = m.get("history") or []
+    d["history"] = []
+    d["historyTotal"] = len(h)
+    d["historyRev"] = history_rev(h)
+    return d
+
+
+def history_payload(m):
+    h = m.get("history") or []
+    return {"machineId": m["machineId"], "prizeId": m["prizeId"],
+            "history": h[-HISTORY_TO_BROWSER:], "historyRev": history_rev(h)}
+
+
+# At most one update per prize per second goes to browsers; anything that
+# arrives sooner is folded into a single later send of the newest state.
+BROADCAST_MIN_GAP = 1.0
+_bcast_last = {}      # prize key -> time of the last send
+_bcast_pending = {}   # prize key -> task that will send the newest state
+
+
 async def broadcast_machine(state):
-    await broadcast({"type": "machineUpdate", "data": state})
+    if not browsers:
+        return
+    key = machine_key(state["machineId"], state["prizeId"])
+    wait = BROADCAST_MIN_GAP - (time.monotonic() - _bcast_last.get(key, 0.0))
+    if wait <= 0:
+        _bcast_last[key] = time.monotonic()
+        await broadcast({"type": "machineUpdate", "data": slim_state(state)})
+        return
+    if key in _bcast_pending:
+        return
+
+    async def later():
+        try:
+            await asyncio.sleep(wait)
+            _bcast_pending.pop(key, None)
+            st = await store.load(key)
+            if st is not None and browsers:
+                _bcast_last[key] = time.monotonic()
+                await broadcast({"type": "machineUpdate", "data": slim_state(st)})
+        finally:
+            _bcast_pending.pop(key, None)
+
+    _bcast_pending[key] = asyncio.create_task(later())
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +558,32 @@ async def keepalive(key, upstream):
                 break
     except asyncio.CancelledError:
         pass
+
+
+# Several prizes on one machine each have their own connection, and all of
+# them receive the same events. Their timing differs by up to a second or
+# more, so letting them all feed one shared status let events arrive out of
+# order and be counted twice. Instead ONE connection per machine (the
+# "leader") drives the shared count; the others only keep their prize
+# details (title, picture, label) current. Leadership passes on if the
+# leader goes quiet, is flagged irrelevant, or disconnects.
+LEADER_TIMEOUT = 30
+_leader = {}   # machineId -> (prize key, time of its last event)
+
+
+def claim_leader(machine_id, key):
+    now = time.monotonic()
+    cur = _leader.get(machine_id)
+    if cur is None or cur[0] == key or now - cur[1] > LEADER_TIMEOUT:
+        _leader[machine_id] = (key, now)
+        return True
+    return False
+
+
+def resign_leader(machine_id, key):
+    cur = _leader.get(machine_id)
+    if cur and cur[0] == key:
+        _leader.pop(machine_id, None)
 
 
 async def pump_upstream(key):
@@ -500,6 +608,7 @@ async def pump_upstream(key):
                     log(f"{key}: TokyoCatch error message: {raw}")
                     if not m.get("prizeStale"):
                         m["prizeStale"] = True
+                        resign_leader(m["machineId"], key)
                         # Flips to True only if TokyoCatch actually keeps
                         # sending play data after the error — see below.
                         m["dataSinceStale"] = False
@@ -525,6 +634,14 @@ async def pump_upstream(key):
                 # Load the machine's other prize records first, then handle the
                 # event and mirror the result with no await in between, so two
                 # connections can never interleave inside one update.
+                if not claim_leader(m["machineId"], key):
+                    # Another connection on this machine drives the count.
+                    apply_prize_meta(m, msg.get("data") or {})
+                    if not m.get("prizeStale"):
+                        m["liveStatus"] = {"ok": True, "msg": "Live — last update " + now_iso()}
+                    await store.save(key, m)
+                    await broadcast_machine(m)
+                    continue
                 sibs = await siblings_of(m["machineId"], key)
                 before = shared_sig(m)
                 handle_status_data(m, msg.get("data") or {})
@@ -545,6 +662,8 @@ async def pump_upstream(key):
     except Exception as e:
         log(f"Upstream for {key} closed: {e}")
     finally:
+        mid = key.split(":", 1)[0]
+        resign_leader(mid, key)
         m = await store.load(key)
         if m is not None:
             m["liveStatus"] = {"ok": False, "msg": "Upstream connection to TokyoCatch closed — reconnecting…"}
@@ -737,12 +856,68 @@ async def send_full_list(websocket):
         m = await store.load(key)
         if m:
             machines.append(m)
-    await websocket.send(json.dumps({"type": "machineList", "data": machines}))
+    await websocket.send(json.dumps({"type": "machineList", "data": [slim_state(m) for m in machines]}))
+
+
+# One address may open at most CONNECT_MAX connections per CONNECT_WINDOW
+# seconds. Each connection costs a full prize list, so a client stuck in a
+# reconnect loop used gigabytes. Over the limit, the connection is closed
+# before any data is sent.
+CONNECT_WINDOW = 60
+CONNECT_MAX = 6
+CONNECT_BLOCK = 1800    # seconds an address stays blocked once it goes over
+_recent_connects = {}   # address -> times of recent connections
+_blocked_until = {}     # address -> time the block ends
+
+
+def client_ip(websocket):
+    try:
+        fwd = websocket.request_headers.get("X-Forwarded-For")
+        if fwd:
+            return fwd.split(",")[0].strip()
+    except Exception:
+        pass
+    ra = getattr(websocket, "remote_address", None)
+    return ra[0] if ra else "?"
+
+
+def client_label(websocket):
+    try:
+        h = websocket.request_headers
+        return f"ip={client_ip(websocket)} origin={h.get('Origin', '-')} ua={(h.get('User-Agent') or '-')[:70]}"
+    except Exception:
+        return f"ip={client_ip(websocket)}"
 
 
 async def handle_browser(websocket):
+    ip = client_ip(websocket)
+    now = time.monotonic()
+    if now < _blocked_until.get(ip, 0.0):
+        try:
+            await websocket.close(code=1013, reason="Too many connections")
+        except Exception:
+            pass
+        return
+    recent = [t for t in _recent_connects.get(ip, []) if now - t < CONNECT_WINDOW]
+    recent.append(now)
+    _recent_connects[ip] = recent
+    if len(_recent_connects) > 500:
+        for k in [k for k, v in _recent_connects.items() if not v or now - v[-1] >= CONNECT_WINDOW]:
+            _recent_connects.pop(k, None)
+        for k in [k for k, t in _blocked_until.items() if t <= now]:
+            _blocked_until.pop(k, None)
+    if len(recent) > CONNECT_MAX:
+        _blocked_until[ip] = now + CONNECT_BLOCK
+        log(f"Blocked {client_label(websocket)} for {CONNECT_BLOCK // 60} min — more than {CONNECT_MAX} connections in {CONNECT_WINDOW}s")
+        try:
+            await websocket.close(code=1013, reason="Too many connections")
+        except Exception:
+            pass
+        return
+
+    last_history_req = {}   # prize key -> time of this browser's last getHistory
     browsers.add(websocket)
-    log(f"Browser connected ({len(browsers)} watching)")
+    log(f"Browser connected ({len(browsers)} watching) {client_label(websocket)}")
     try:
         await send_full_list(websocket)
         async for raw in websocket:
@@ -756,6 +931,16 @@ async def handle_browser(websocket):
 
             if msg_type == "listMachines":
                 await send_full_list(websocket)
+
+            elif msg_type == "getHistory":
+                mid, pid = data.get("machineId"), data.get("prizeId")
+                if mid and pid:
+                    hk = machine_key(mid, pid)
+                    if time.monotonic() - last_history_req.get(hk, 0.0) >= 0.3:
+                        last_history_req[hk] = time.monotonic()
+                        st = await store.load(hk)
+                        if st is not None:
+                            await websocket.send(json.dumps({"type": "history", "data": history_payload(st)}))
 
             elif msg_type == "startTracking":
                 machine_id = data.get("machineId")
