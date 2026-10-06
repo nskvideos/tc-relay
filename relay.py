@@ -1,55 +1,47 @@
 """
-Multi-client relay for the TokyoCatch claw-machine dashboard — Option B.
+Relay for the TokyoCatch claw-machine dashboard ("The Chosen Ones").
 
-Why this exists:
+Why this exists
 TokyoCatch's live WebSocket (wss://api.tokyocatch.com/subscriptions/v2) only
 sends data to connections whose Origin header is https://tokyocatch.com.
-Browsers set that header themselves based on the page's real address, so a
-dashboard hosted anywhere else can never talk to TokyoCatch directly. This
-relay is a small server that DOES connect with the right Origin header, and
-forwards the live data down to any number of browsers watching the
-dashboard, wherever it's hosted.
+Browsers set that header from the page's real address, so a dashboard hosted
+anywhere else can never talk to TokyoCatch directly. This relay connects with
+the right Origin header and forwards the data to any number of browsers.
 
-What changed from the old (per-room) relay:
-Previously, all counting/win-detection/history logic lived in each browser's
-JS + localStorage, and the relay just piped raw TokyoCatch messages through.
-That meant: (1) counting stopped the moment every browser closed, because
-each room's upstream connection was torn down ~30s after the last browser
-disconnected, and (2) two people watching the same machine could see two
-different counts, since each browser counted independently from whatever
-moment it happened to connect.
+What the relay owns
+All shared, durable state lives here, so every browser sees the same numbers
+and counting carries on with zero browsers connected:
+  - which machineId/prizeId pairs are tracked
+  - the play count, step history, last win and current status
+  - the THREE_CLAW payout numbers (usual rate, last payout owed, payout)
+  - category overrides
+Only personal preferences stay in each browser's localStorage: display names,
+play-count alert thresholds and section collapse state.
 
-Now the relay itself owns the shared, durable state for every tracked
-machine:
-  - play count (`livePlays`)
-  - win detection + history
-  - the machine list itself (which machineId/prizeId pairs are tracked)
-These are broadcast to every connected browser, so everyone always sees the
-same numbers, and tracking continues even with zero browsers connected —
-tracking only stops when a browser explicitly asks the relay to stop.
+One count per machine
+Each tracked prize has its own connection to TokyoCatch, but prizes on the
+same machine share one count, history, last win and payout (SHARED_FIELDS).
+One connection per machine (the "leader") drives that count so events from
+two connections can never interleave, and a minimum gap between plays
+(MIN_PLAY_GAP) ignores echoes of the same play.
 
-Still personal/local per browser (unchanged, lives in that browser's own
-localStorage, never sent here): alert threshold + armed/fired state, the
-THREE_CLAW fixed-payout tracker's "usual rate" and derived predictions, and
-each machine's display name. The relay broadcasts `lastAutoWin` (the play
-count a win landed on) so each browser can compute its own payout math
-against its own personal rate.
+Keeping bandwidth low (Render's free plan allows 5 GB a month)
+Browsers get prize records without step history on connect and on every
+update, at most one update per prize per second. A card asks for its history
+(getHistory) only while it is expanded. An address that opens too many
+connections is blocked for a while.
 
-Persistence: the `Store` class below talks to Upstash Redis over its REST
-API (a plain HTTPS POST per command — no TCP connection to manage, which
-suits this relay's already-async design). It needs two environment
-variables set wherever this relay runs: UPSTASH_REDIS_REST_URL and
-UPSTASH_REDIS_REST_TOKEN (from the Upstash console's Connect > REST tab).
-If they're not set, Store quietly falls back to an in-memory dict instead
-of failing outright — handy for a quick local test run, but state in that
-mode does NOT survive a restart, so production (Render) must have both env
-vars set.
+Persistence
+The `Store` class talks to Upstash Redis over its REST API. It needs the
+environment variables UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN.
+Without them it falls back to an in-memory dict, which does NOT survive a
+restart, so production must have both set. Changed prizes are written every
+FLUSH_SECONDS and on shutdown.
 
-Known remaining gap even with Upstash wired in: Render's free tier fully
-sleeps the process after 15 minutes with zero incoming traffic, which
-would freeze counting. That needs an external uptime pinger (e.g.
-UptimeRobot) hitting this relay's URL every 5-10 minutes — a required
-follow-up piece, not optional, given the "always counting" goal.
+Keep-alive
+Render's free tier sleeps the process after 15 minutes without traffic, which
+would stop counting. An external pinger (UptimeRobot, HEAD request every
+5 minutes) keeps it awake; this relay answers HEAD requests for that.
 """
 
 import asyncio
@@ -68,8 +60,17 @@ UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 TRACKED_SET_KEY = "claw:tracked_machines"
 MACHINE_KEY_PREFIX = "claw:machine:"
-FLUSH_SECONDS = 5      # how often changed machines are written to Upstash
-MAX_HISTORY = 300      # step-history rows kept per prize (dashboard shows the latest 80)
+
+# --- Settings you may want to tune -----------------------------------------
+FLUSH_SECONDS = 5          # how often changed prizes are written to Upstash
+MAX_HISTORY = 300          # step-history rows stored per prize
+HISTORY_TO_BROWSER = 80    # rows sent when a card asks for its history
+MIN_PLAY_GAP = 10          # seconds; two plays (or wins) on a machine are never closer
+BROADCAST_MIN_GAP = 1.0    # seconds; at most one update per prize to browsers
+LEADER_TIMEOUT = 30        # seconds of silence before another connection takes over a machine
+CONNECT_WINDOW = 60        # seconds over which connections per address are counted
+CONNECT_MAX = 6            # connections allowed per address in that window
+CONNECT_BLOCK = 1800       # seconds an address stays blocked once it goes over
 
 
 def log(msg):
@@ -205,26 +206,10 @@ store = Store()
 # runtime[key] = {"upstream":.., "pump_task":.., "keepalive_task":..}
 runtime = {}
 
-# Every currently-connected browser. State updates are broadcast to all of
-# them — there's no more per-(machineId,prizeId) subscription filtering,
-# since every browser sees every tracked machine now.
+# Every currently-connected browser; updates go to all of them.
 browsers = set()
 
 
-# ---------------------------------------------------------------------------
-# Ported from index.html's handleStatusData(). Mirrors it field-for-field,
-# minus the parts that depend on personal/local browser state:
-#   - checkPlayCountAlert(), beep(), notify() -> personal alert threshold,
-#     stays client-side; the client re-derives "did we cross my threshold"
-#     from the livePlays value broadcast after every update.
-#   - the THREE_CLAW payout-tracker math -> depends on each browser's own
-#     "usual rate", stays client-side; the client re-derives it from the
-#     `lastAutoWin` count broadcast on a win.
-#   - pendingPlayer -> dead code upstream (the manual "who's playing" input
-#     was removed from the HTML), so it's dropped here too; player comes
-#     only from `currentPlayingUser`.
-# Returns True if this call just detected a win (so the caller can log it).
-# ---------------------------------------------------------------------------
 def trim_history(m):
     """Keep the step history bounded so memory and every saved/broadcast
     message stop growing forever. Counts are stored separately (livePlays,
@@ -232,9 +217,6 @@ def trim_history(m):
     h = m.get("history")
     if h is not None and len(h) > MAX_HISTORY + 100:
         del h[:-MAX_HISTORY]
-
-
-MIN_PLAY_GAP = 10  # seconds; two plays/wins on one machine can never be closer
 
 
 def apply_prize_meta(m, data):
@@ -266,6 +248,10 @@ def apply_prize_meta(m, data):
 
 
 def handle_status_data(m, data):
+    """Apply one TokyoCatch status message to a prize's state: count a play
+    when the status moves into "playing", log a win on "get" (resetting the
+    count and updating the THREE_CLAW payout), and keep the latest live
+    fields. Alerts and sounds are the dashboard's job, not done here."""
     trim_history(m)
     status = data.get("status")
     current_playing_user = data.get("currentPlayingUser")
@@ -474,13 +460,6 @@ async def broadcast(msg):
         browsers.discard(d)
 
 
-# Browsers only ever show the latest 80 step-history rows, so that is all they
-# are sent (the relay still stores up to MAX_HISTORY). `historyTotal` carries
-# the real row count for the "Step history (N)" heading. This is what keeps a
-# new connection from receiving 26 prizes x 300 rows.
-HISTORY_TO_BROWSER = 80
-
-
 def history_rev(h):
     """Changes whenever a row is added or the newest row becomes a win, so the
     dashboard knows when its copy of the history is out of date."""
@@ -509,9 +488,8 @@ def history_payload(m):
             "history": h[-HISTORY_TO_BROWSER:], "historyRev": history_rev(h)}
 
 
-# At most one update per prize per second goes to browsers; anything that
-# arrives sooner is folded into a single later send of the newest state.
-BROADCAST_MIN_GAP = 1.0
+# Updates to browsers are limited to one per BROADCAST_MIN_GAP per prize;
+# anything that arrives sooner is folded into one later send of the newest state.
 _bcast_last = {}      # prize key -> time of the last send
 _bcast_pending = {}   # prize key -> task that will send the newest state
 
@@ -567,7 +545,6 @@ async def keepalive(key, upstream):
 # "leader") drives the shared count; the others only keep their prize
 # details (title, picture, label) current. Leadership passes on if the
 # leader goes quiet, is flagged irrelevant, or disconnects.
-LEADER_TIMEOUT = 30
 _leader = {}   # machineId -> (prize key, time of its last event)
 
 
@@ -860,12 +837,9 @@ async def send_full_list(websocket):
 
 
 # One address may open at most CONNECT_MAX connections per CONNECT_WINDOW
-# seconds. Each connection costs a full prize list, so a client stuck in a
-# reconnect loop used gigabytes. Over the limit, the connection is closed
-# before any data is sent.
-CONNECT_WINDOW = 60
-CONNECT_MAX = 6
-CONNECT_BLOCK = 1800    # seconds an address stays blocked once it goes over
+# seconds; past that it is blocked for CONNECT_BLOCK seconds and its
+# connections are closed before any data is sent. (A client stuck in a
+# reconnect loop used gigabytes before this existed.)
 _recent_connects = {}   # address -> times of recent connections
 _blocked_until = {}     # address -> time the block ends
 
